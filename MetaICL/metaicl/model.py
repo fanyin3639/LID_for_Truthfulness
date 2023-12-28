@@ -207,11 +207,12 @@ class MetaICLModel(object):
 
         self.logger.info("Finish training")
 
-    def do_inference(self, data, batch_size=1, verbose=False):
+    def do_inference(self, data, batch_size=1, verbose=False, require_logits=False):
         dataloader = data.get_dataloader(batch_size, is_training=False)
         if verbose:
             dataloader = tqdm(dataloader)
         losses = []
+        logits = []
         for batch in dataloader:
             input_ids=batch[0].cuda()
             attention_mask=batch[1].cuda()
@@ -221,13 +222,23 @@ class MetaICLModel(object):
             else:
                 labels=batch[3].cuda()
             with torch.no_grad():
-                loss = self.run_model(input_ids, attention_mask, token_type_ids, labels=labels)
+                if not require_logits:
+                    loss = self.run_model(input_ids, attention_mask, token_type_ids, labels=labels)
+                else:
+                    loss, logit = self.run_model(input_ids, attention_mask, token_type_ids, labels=labels, require_logits=True)
+                    logits += logit.cpu().detach().numpy().tolist()
             losses += loss.cpu().detach().numpy().tolist()
-        return losses
+        if require_logits:
+            return losses, logits
+        else:
+            return losses
 
-    def do_predict(self, data, batch_size=1, losses=None, verbose=False, require_loss=False, label_id=None):
+    def do_predict(self, data, batch_size=1, losses=None, verbose=False, require_loss=False, require_logits=False, label_id=None):
         if losses is None:
-            losses = self.do_inference(data, batch_size, verbose=verbose)
+            if require_logits:
+                losses, logits = self.do_inference(data, batch_size, verbose=verbose, require_logits=True)
+            else:
+                losses = self.do_inference(data, batch_size, verbose=verbose)
         losses = np.array(losses)
         assert len(losses) == len(data)
         predictions = []
@@ -240,28 +251,33 @@ class MetaICLModel(object):
             if not require_loss:
                 prediction_idx = sorted(enumerate(curr_label_losses), key=lambda x: x[1])[0][0]
                 prediction = dp["options"][prediction_idx]
-                predictions.append(prediction.strip())
+                predictions.append([prediction.strip()])
             else:
                 prediction_terms = sorted(enumerate(curr_label_losses), key=lambda x: x[1])[0]
                 prediction = dp["options"][prediction_terms[0]]
                 negative_pred_prob = prediction_terms[1]
-                predictions.append([prediction.strip(), negative_pred_prob])
+                if require_logits:
+                    predictions.append([prediction.strip(), negative_pred_prob, logits])
+                else:
+                    predictions.append([prediction.strip(), negative_pred_prob])
+
         return predictions
 
-    def run_model(self, input_ids, attention_mask, token_type_ids, labels=None):
+    def run_model(self, input_ids, attention_mask, token_type_ids, labels=None,require_logits=False):
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
         logits = outputs.logits[..., :-1, :].contiguous()
-
+        probs = F.softmax(logits, dim=-1)
         if labels is None:
             labels = input_ids
         labels = labels[..., 1:].contiguous()
         label_mask = token_type_ids[..., 1:].contiguous()
-
         loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
         losses = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1)) # [batch_size, length]
-
         losses = losses.view(logits.size(0), logits.size(1)) * label_mask
-        return torch.sum(losses, axis=1) / torch.sum(label_mask, axis=1)
+        if require_logits:
+            return torch.sum(losses, axis=1) / torch.sum(label_mask, axis=1), torch.exp(-losses[:, label_mask[0] == 1])[0]
+        else:
+            return torch.sum(losses, axis=1) / torch.sum(label_mask, axis=1)
 
 def setup_fp16(model, optimizer):
     try:

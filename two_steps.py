@@ -11,12 +11,97 @@ from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_similarity
 from utils import codex_execution
 
-def prompt_retrieval(train_embs,test_embs,train_examples,eval_examples,return_string,format_example,
-                     maximum_input_len,args, label_map,prompt_identifier='prompts',single_context_example_len=None):
+
+def prompt_retrieval_self_check(one_test_instance, context, in_context_examples, train_examples, tokenizer, predicted_answers, format_example, maximum_input_len):
+    one_test_instance_input_text, one_test_instance_output_text = format_example(example=one_test_instance, override_output=predicted_answers[0])
+    cur_prompt_string_len = get_instance_length(one_test_instance_input_text, one_test_instance_output_text, tokenizer)[
+        0]
+    select_indices = in_context_examples[1]
+    select_num = len(select_indices)
+    cur_train_data = ''
+    for idx in range(select_num):
+        if idx % 2 == 0:
+            cur_input_text, cur_output_text = format_example(example=train_examples[select_indices[idx][0]])
+        else:
+            cur_input_text, cur_output_text = format_example(example=train_examples[select_indices[idx][0]], override_output=train_examples[random.choice([i for i in range(len(train_examples))])]['label'], label='False')
+        cur_len = sum(get_instance_length(cur_input_text, cur_output_text, tokenizer=tokenizer))
+        cur_prompt_string_len += cur_len
+        if cur_prompt_string_len > maximum_input_len:
+            break
+        else:
+            cur_train_data += f'{cur_input_text}{cur_output_text}\n\n'
+    cur_train_data += format_example(
+        example=one_test_instance, override_output=predicted_answers[0])[0]
+    return cur_train_data
+
+
+def prompt_retrieval_random(tokenizer, train_examples, eval_examples, return_string,format_example,
+                     maximum_input_len, args, label_map, prompt_identifier='prompts', single_input_len=None, inference_data_module=None):
     cos = nn.CosineSimilarity(dim=1, eps=1e-6)
     eval_example_num = len(eval_examples)
+    train_example_num = len(train_examples)
     bar = tqdm(range(eval_example_num), desc="Retrieve examples from annotated pool")
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    prompt_cache_dir = os.path.join(args.output_dir,prompt_identifier)
+    if not os.path.isdir(prompt_cache_dir):
+        os.makedirs(prompt_cache_dir, exist_ok=True)
+    for test_id, one_test_instance in enumerate(eval_examples):
+        one_test_instance_input_text,one_test_instance_output_text = format_example(example=one_test_instance,args=args,
+                                                                                    label_map=label_map)
+        cur_prompt_string_len = get_instance_length(one_test_instance_input_text,one_test_instance_output_text,tokenizer)[0]
+
+        sorted_indices = random.sample(list(range(train_example_num)), 10)
+        selected_indices = []
+        num_indices = len(sorted_indices)
+        for idx in range(num_indices - 1, -1, -1):
+
+            cur_example_input_text,cur_example_output_text = format_example(example=train_examples[sorted_indices[idx]],
+                                                                            args=args,label_map=label_map)
+            cur_len = sum(get_instance_length(cur_example_input_text, cur_example_output_text,tokenizer=tokenizer))
+            if single_input_len is not None and cur_len>single_input_len:
+                continue
+            cur_prompt_string_len += cur_len
+            if cur_prompt_string_len > maximum_input_len:
+                break
+            selected_indices.append(idx)
+        select_num = len(selected_indices)
+        final_num = min(select_num, args.max_in_context_samples)
+        second_phase_selected_indices = []
+        if return_string:
+            cur_train_data = '<|user|>\n'
+            # cur_train_data += 'Answer these questions:\n'
+        else:
+            cur_train_data = []
+        for idx in range(select_num - 1, select_num - final_num - 1, -1):
+            cur_input_text, cur_output_text = format_example(
+                example=train_examples[sorted_indices[selected_indices[idx]]],
+                args=args, label_map=label_map)
+            if return_string:
+                cur_train_data += f'{cur_input_text}{cur_output_text}\n\n'
+            else:
+                cur_train_data.append({
+                    'input': cur_input_text,
+                    'output': cur_output_text
+                })
+            second_phase_selected_indices.append([sorted_indices[selected_indices[idx]]])
+        if return_string:
+            cur_train_data += format_example(
+                example=one_test_instance,
+                args=args, label_map=label_map)[0]
+        cur_train_data += "<|assistant|> "
+        # print(f'{len(second_phase_selected_indices)} examples in context')
+        with open(os.path.join(prompt_cache_dir,f"{one_test_instance['id']}.json"),'w') as f:
+            json.dump([[test_id, second_phase_selected_indices, one_test_instance['label']],
+                       cur_train_data,
+                       one_test_instance
+                       ], f, indent=4)
+        bar.update(1)
+
+def prompt_retrieval(tokenizer, train_embs, test_embs, train_examples, eval_examples, return_string,format_example,
+                     maximum_input_len, args, label_map, prompt_identifier='prompts', single_input_len=None, inference_data_module=None):
+    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+    eval_example_num = len(eval_examples)
+    train_example_num = len(train_examples)
+    bar = tqdm(range(eval_example_num), desc="Retrieve examples from annotated pool")
     prompt_cache_dir = os.path.join(args.output_dir,prompt_identifier)
     if not os.path.isdir(prompt_cache_dir):
         os.makedirs(prompt_cache_dir, exist_ok=True)
@@ -29,18 +114,21 @@ def prompt_retrieval(train_embs,test_embs,train_examples,eval_examples,return_st
             scores = cos(test_e_reshape, train_embs).numpy()
             sorted_indices = np.argsort(scores)
         elif args.prompt_retrieval_method=='random':
-            sorted_indices = np.random.permutation(range(eval_example_num))
+            sorted_indices = np.random.permutation(range(train_example_num))
         else:
             raise ValueError(f"The prompt retrieval method {args.prompt_retrieval_method} is not supported")
+
         selected_indices = []
         num_indices = len(sorted_indices)
         for idx in range(num_indices - 1, -1, -1):
+
             if args.prompt_retrieval_method=='similar' and scores[sorted_indices[idx]]==1:
                 continue
+
             cur_example_input_text,cur_example_output_text = format_example(example=train_examples[sorted_indices[idx]],
                                                                             args=args,label_map=label_map)
             cur_len = sum(get_instance_length(cur_example_input_text, cur_example_output_text,tokenizer=tokenizer))
-            if single_context_example_len is not None and cur_len>single_context_example_len:
+            if single_input_len is not None and cur_len>single_input_len:
                 continue
             cur_prompt_string_len += cur_len
             if cur_prompt_string_len > maximum_input_len:
@@ -60,17 +148,19 @@ def prompt_retrieval(train_embs,test_embs,train_examples,eval_examples,return_st
         selected_indices = new_selected_indices
 
         select_num = len(selected_indices)
+        # final_num = min(select_num, args.max_in_context_samples)
+        final_num = select_num
         second_phase_selected_indices = []
         if return_string:
             cur_train_data = ''
         else:
             cur_train_data = []
-        for idx in range(select_num - 1, -1, -1):
+        for idx in range(select_num - 1, select_num - final_num - 1, -1):
             cur_input_text, cur_output_text = format_example(
                 example=train_examples[sorted_indices[selected_indices[idx]]],
                 args=args, label_map=label_map)
             if return_string:
-                cur_train_data += f'{cur_input_text}{cur_output_text}\n\n'
+                cur_train_data += f'{cur_input_text}{cur_output_text}\n'
             else:
                 if args.task_name=='hellaswag':
                     cur_train_data.append({
@@ -142,7 +232,7 @@ def iterative_selection(train_embs,test_embs,train_examples,test_examples,return
                                       vote_file=os.path.join(args.output_dir,'votek_cache.json'))
     else:
         raise ValueError(f'iterative selection does not support {args.selective_annotation_method}')
-    if not args.task_name in ['hellaswag', 'xsum','nq']:
+    if not args.task_name in ['hellaswag', 'xsum','nq', 'narraqa']:
         all_labels = []
         label_to_digit = {}
         for k, v in label_map.items():
@@ -174,7 +264,7 @@ def iterative_selection(train_embs,test_embs,train_examples,test_examples,return
             os.makedirs(output_dir, exist_ok=True)
         count = 0
         execution_count = 0
-        model_keys = args.model_key.split('##')
+        model_keys = args.model_key.split('##') if not args.model_key is None else None
         running_flag = True
         while running_flag:
             running_flag = False
@@ -196,39 +286,46 @@ def iterative_selection(train_embs,test_embs,train_examples,test_examples,return
                         prediction = inference_model.do_predict(inference_data_module, require_loss=True)[0]
                         with open(f"{output_dir}/{file}", 'w') as f:
                             json.dump(prediction, f)
-                    elif args.task_name=='xsum':
-                        with open(os.path.join(prompt_dir, file)) as f:
-                            one_test_example = json.load(f)
-                        context = one_test_example[1]
-                        input_ids = tokenizer_gpt(context, return_tensors="pt").input_ids
-                        input_ids = input_ids[:, :1900]
-                        input_len = input_ids.shape[1]
-                        input_ids = input_ids.to(device)
-                        # print(input_ids.shape)
-                        # print(os.path.join(prompt_dir,file))
-                        gen_tokens = inference_model.generate(input_ids, do_sample=False, temperature=0.7,
-                                                              max_length=input_len + 64,
-                                                              output_scores=True, return_dict_in_generate=True)
-                        generated_text = tokenizer_gpt.batch_decode(gen_tokens.sequences.view(-1, 1))  #
-                        stop = ['--', '\n', ';', '#']
-                        stop_index = len(generated_text)
-                        for i, c in enumerate(generated_text):
-                            if i > input_len and c.strip(' ') in stop:
-                                stop_index = i
-                                break
-                        prediction = [' '.join(generated_text[input_len:stop_index]),
-                                      sum(gen_tokens.probs[:stop_index - input_len])]
-                        with open(f"{output_dir}/{file}", 'w') as f:
-                            json.dump(prediction, f)
-                    elif args.task_name=='nq':
-                        cur_key = model_keys[execution_count % len(model_keys)]
-                        execution_count += 1
-                        try:
-                            codex_execution(key=cur_key,output_path=os.path.join(output_dir,file),
-                                            prompt_path=os.path.join(prompt_dir, file))
-                        except Exception as e:
-                            print(e)
-                            time.sleep(3)
+                    elif args.task_name in ['xsum', 'nq', 'narraqa']:
+                        if not args.use_api_model:
+                            with open(os.path.join(prompt_dir, file)) as f:
+                                one_test_example = json.load(f)
+                            context = one_test_example[1]
+                            input_ids = tokenizer_gpt(context, return_tensors="pt").input_ids
+                            input_ids = input_ids[:, :args.maximum_input_len]
+                            input_len = input_ids.shape[1]
+                            input_ids = input_ids.to(device)
+                            gen_tokens = inference_model.generate(input_ids, do_sample=False, temperature=0.7,
+                                                                  max_length=input_len + 64,
+                                                                  output_scores=True, return_dict_in_generate=True)
+
+                            generated_text = tokenizer_gpt.batch_decode(gen_tokens.sequences.view(-1, 1))
+                            stop = ['--', '\n', ';', '#']
+                            stop_index = len(generated_text)
+                            for i, c in enumerate(generated_text):
+                                if i > input_len and c.strip(' ') in stop:
+                                    stop_index = i
+                                    break
+
+                            all_probs= []
+                            next_tokens_scores = torch.cat(gen_tokens.scores)
+                            probs = nn.functional.softmax(next_tokens_scores, dim=-1)
+                            next_tokens = torch.argmax(next_tokens_scores, dim=-1)
+                            all_probs = probs[torch.arange(len(probs)), next_tokens]
+                            prediction = [' '.join(generated_text[input_len:stop_index]),
+                                          torch.sum(all_probs[:stop_index - input_len]).item()]
+                            with open(f"{output_dir}/{file}", 'w') as f:
+                                json.dump(prediction, f)
+
+                        else:
+                            cur_key = model_keys[execution_count % len(model_keys)]
+                            execution_count += 1
+                            try:
+                                codex_execution(key=cur_key, output_path=os.path.join(output_dir, file),
+                                                prompt_path=os.path.join(prompt_cache_dir, file))
+                            except Exception as e:
+                                print(e)
+                                time.sleep(3)
                     else:
                         with open(os.path.join(prompt_dir, file)) as f:
                             one_test_example = json.load(f)
@@ -247,19 +344,19 @@ def iterative_selection(train_embs,test_embs,train_examples,test_examples,return
         n = len(test_examples)
         for idx in range(n):
             if idx in selected_indices:
-                if args.task_name in ['xsum','nq']:
+                if args.task_name in ['xsum','nq', 'narraqa']:
                     idx_scores[idx] = float('inf')
                 else:
                     idx_scores[idx] = float('-inf')
                 continue
             with open(f"{output_dir}/{idx}.json") as f:
                 one_pred = json.load(f)
-                if args.task_name in ['nq']:
+                if args.use_api_model:
                     idx_scores[idx] = sum(one_pred['choices'][0]["logprobs"]["token_logprobs"]) / len(
                         one_pred['choices'][0]["logprobs"]["token_logprobs"])
                 else:
-                    idx_scores[idx] = one_pred[1]
-        if args.task_name in ['xsum','nq']:
+                    idx_scores[idx] = one_pred[1] / len(one_pred[0].split())
+        if args.task_name in ['xsum','nq', 'narraqa']:
             sorted_scores = sorted(idx_scores.items(), key=lambda x: x[1])
         else:
             sorted_scores = sorted(idx_scores.items(), key=lambda x:x[1],reverse=True)
@@ -311,10 +408,10 @@ def iterative_selection(train_embs,test_embs,train_examples,test_examples,return
                 print(f"{args.annotation_size - len(selected_indices)} examples are randomly selected")
     return selected_indices
 
-def selective_annotation(args,**kwargs):
+def selective_annotation(args, **kwargs):
     if args.selective_annotation_method=='random':
         train_examples = kwargs['train_examples']
-        selected_indices = random.sample(range(len(train_examples)),args.annotation_size)
+        selected_indices = random.sample(range(len(train_examples)), args.annotation_size)
     elif args.selective_annotation_method=='diversity':
         embeddings = kwargs['embeddings']
         selected_indices = []
@@ -354,7 +451,7 @@ def selective_annotation(args,**kwargs):
                                                format_example=kwargs['format_example'],
                                                maximum_input_len=kwargs['maximum_input_len'],
                                                label_map=kwargs['label_map'],
-                                               single_context_example_len=kwargs['single_context_example_len'],
+                                               single_context_example_len=kwargs['single_input_len'],
                                                inference_model=kwargs['inference_model'],
                                                inference_data_module=kwargs['inference_data_module'],
                                                tokenizer_gpt=kwargs['tokenizer_gpt'],

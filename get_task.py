@@ -141,6 +141,66 @@ def process_nq_examples(examples):
         })
     return processed_examples
 
+def process_narra_examples(examples):
+    processed_examples = []
+    for idx, e in enumerate(examples):
+        processed_examples.append({
+            'id': idx,
+            'summary': e['document']['summary']['text'],
+            'question': e['question']['text'],
+            'answer1': e['answers'][0]['text'],
+            'answer2': e['answers'][1]['text'],
+            'label': e['answers'][0]['text'] if random.random() > 0.5 else e['answers'][1]['text'],
+        })
+    return processed_examples
+
+def process_hotpot_examples(examples):
+    processed_examples = []
+    for idx, e in enumerate(examples):
+        processed_examples.append({
+            'id': idx,
+            'question': e['input'],
+            'label': e['output'][0]['answer']
+        })
+    return processed_examples
+
+def process_trivia_examples(examples):
+    processed_examples = []
+    for idx, e in tqdm(enumerate(examples), total=len(examples)):
+        if not e['question'].endswith('?'):
+            question = e['question'] + '?'
+        else:
+            question = e['question']
+        processed_examples.append({
+            'id': idx,
+            'question': question,
+            'label': e['answer']['value'],
+        })
+    return processed_examples
+
+def process_coqa_examples(examples):
+    processed_examples = []
+    for sample_id, sample in enumerate(examples):
+        story = sample['story']
+        questions = sample['questions']
+        answers = sample['answers']
+        additional_answers = sample['additional_answers'] if 'additional_answers' in sample else []
+        for question_index, question in enumerate(questions):
+            additional_answers_list = []
+            if len(additional_answers) > 0:
+                for i in range(3):
+                    additional_answers_list.append(additional_answers[str(i)][question_index]['input_text'])
+
+            processed_examples.append({
+                'id': sample['id'] + '_' + str(question_index),
+                'summary': story,
+                'question': question['input_text'],
+                'label': answers[question_index]['input_text'],
+                'additional_answers': additional_answers_list
+            })
+    return processed_examples
+
+
 def get_task(args):
     task_name = args.task_name
     data_cache_dir = args.data_cache_dir
@@ -287,7 +347,7 @@ def get_task(args):
             with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
                 total_eval_examples = json.load(f)
         else:
-            dbpedia_datasets = load_dataset('dbpedia_14',revision="master",cache_dir=data_cache_dir)
+            dbpedia_datasets = load_dataset('dbpedia_14', cache_dir=data_cache_dir)
             total_train_examples = [e for e in dbpedia_datasets['train']]
             total_train_examples = random.sample(total_train_examples, 3000)
             total_train_examples = process_dbpedia_examples(total_train_examples)
@@ -342,7 +402,6 @@ def get_task(args):
         def format_example(example,label_map,**kwargs):
             return f"The topic is {example['activity_label']}. {example['ctx_a']} " \
                    f"{example['ctx_b']} ",f"{example['endings'][example['label']]}"
-
         all_train_text_to_encode = [f"The topic is {raw_item['activity_label']}. {raw_item['ctx_a']} {raw_item['ctx_b']} | " \
                                   f"{raw_item['endings'][0]} | " \
                                   f"{raw_item['endings'][1]} | " \
@@ -396,7 +455,8 @@ def get_task(args):
             with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
                 total_eval_examples = json.load(f)
         else:
-            nq_dataset = load_dataset('natural_questions', cache_dir=data_cache_dir)
+
+            nq_dataset = load_dataset('natural_questions', beam_runner = 'DirectRunner', cache_dir=data_cache_dir)
             first_sub_sample_indices = random.sample(range(len(nq_dataset['train'])), 12000)
             train_data = nq_dataset['train'].select(first_sub_sample_indices).map(format_dataset)
             total_train_examples = train_data.remove_columns(["annotations", "document", "id"]).filter(
@@ -413,6 +473,8 @@ def get_task(args):
                 json.dump(total_train_examples, f, indent=4)
             with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json'), 'w') as f:
                 json.dump(total_eval_examples, f, indent=4)
+            print(total_eval_examples[0])
+            assert(0)
         if args.debug:
             args.annotation_size = 10
             args.batch_size = 1
@@ -431,7 +493,144 @@ def get_task(args):
         all_eval_text_to_encode = [raw_item['question']
                                    for raw_item in total_eval_examples]
         label_map = None
+    elif args.task_name == 'hotpotqa':
+        if os.path.isfile(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) and \
+                os.path.isfile(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')):
+            print('use cached examples')
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) as f:
+                total_train_examples = json.load(f)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
+                total_eval_examples = json.load(f)
+        else:
+            hotpotqa_dataset = load_dataset("kilt_tasks", name="hotpotqa")
+            total_train_examples = [e for e in hotpotqa_dataset['train']]
+            total_train_examples = random.sample(total_train_examples, 10000)
+            total_train_examples = process_hotpot_examples(total_train_examples)
+            total_eval_examples = [e for e in hotpotqa_dataset['train']]
+            total_eval_examples = random.sample(total_eval_examples, 10000)
+            total_eval_examples = process_hotpot_examples(total_eval_examples)
+
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_train_examples, f, indent=4)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_eval_examples, f, indent=4)
+        if args.debug:
+            args.annotation_size = 10
+            args.batch_size = 1
+            total_train_examples = total_train_examples[:50]
+            total_eval_examples = total_eval_examples[:5]
+
+        def format_example(example, label_map, **kwargs):
+            return f"Q: {example['question']}\nA: ", f"{example['label']}"
+
+        all_train_text_to_encode = [f"question: {raw_item['question']}, answer: {raw_item['label']}"
+                                    for raw_item in total_train_examples]
+        all_eval_text_to_encode = [f"question: {raw_item['question']}, answer: {raw_item['label']}"
+                                   for raw_item in total_eval_examples]
+        label_map = None
+    elif args.task_name == 'narraqa':
+        if os.path.isfile(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) and \
+                os.path.isfile(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')):
+            print('use cached examples')
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) as f:
+                total_train_examples = json.load(f)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
+                total_eval_examples = json.load(f)
+        else:
+            narraqa_dataset = load_dataset('narrativeqa',cache_dir=data_cache_dir)
+            total_train_examples = [e for e in narraqa_dataset['train']]
+            total_train_examples = random.sample(total_train_examples, 5000)
+            total_train_examples = process_narra_examples(total_train_examples)
+            total_eval_examples = [e for e in narraqa_dataset['test']]
+            total_eval_examples = random.sample(total_eval_examples, 5000)
+            total_eval_examples = process_narra_examples(total_eval_examples)
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_train_examples, f, indent=4)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_eval_examples, f, indent=4)
+        if args.debug:
+            args.annotation_size = 10
+            args.batch_size = 1
+            total_train_examples = total_train_examples[:50]
+            total_eval_examples = total_eval_examples[:5]
+        def format_example(example, label_map, **kwargs):
+            assert f"{example['answer2']}", f"{example['answer1']}"
+            return f"Context: {example['summary']}\n'Question': {example['question']}\n'Answer: '", f"{example['label']}"
+
+        all_train_text_to_encode = [f"summary: {raw_item['summary']}, question: {raw_item['question']}"
+                                    for raw_item in total_train_examples]
+        all_eval_text_to_encode = [f"summary: {raw_item['summary']}, question: {raw_item['question']}"
+                                   for raw_item in total_eval_examples]
+        label_map = None
+    elif args.task_name == 'triviaqa':
+        if os.path.isfile(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) and \
+                os.path.isfile(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')):
+            print('use cached examples')
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) as f:
+                total_train_examples = json.load(f)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
+                total_eval_examples = json.load(f)
+        else:
+            triviaqa_dataset = load_dataset('trivia_qa', 'rc.nocontext', cache_dir=data_cache_dir)
+            total_train_examples = [e for e in triviaqa_dataset['train']]
+            total_train_examples_total = random.sample(total_train_examples, 7000)
+            total_train_examples = total_train_examples_total[:5000]
+            total_eval_examples = total_train_examples_total[5000:]
+            total_train_examples = process_trivia_examples(total_train_examples)
+            # total_eval_examples = [e for e in triviaqa_dataset['validation']]
+            # total_eval_examples = random.sample(total_eval_examples, 256)
+            total_eval_examples = process_trivia_examples(total_eval_examples)
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_train_examples, f, indent=4)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_eval_examples, f, indent=4)
+        if args.debug:
+            args.annotation_size = 10
+            args.batch_size = 1
+            total_train_examples = total_train_examples[:50]
+            total_eval_examples = total_eval_examples[:5]
+        def format_example(example, label_map, **kwargs):
+            return f"{example['question']}\n", f"{example['label']}"
+        all_train_text_to_encode = [f"question: {raw_item['question']}, answer: {raw_item['label']}"
+                                    for raw_item in total_train_examples]
+        all_eval_text_to_encode = [f"question: {raw_item['question']}, answer: {raw_item['label']}"
+                                   for raw_item in total_eval_examples]
+        label_map = None
+    elif args.task_name == 'coqa':
+        if os.path.isfile(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) and \
+                os.path.isfile(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')):
+            print('use cached examples')
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json')) as f:
+                total_train_examples = json.load(f)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json')) as f:
+                total_eval_examples = json.load(f)
+        else:
+            with open(f'coqa-train-v1.0.json', 'r') as infile:
+                total_train_examples = json.load(infile)['data']
+            with open(f'coqa-dev-v1.0.json', 'r') as infile:
+                total_eval_examples = json.load(infile)['data']
+            total_train_examples = process_coqa_examples(total_train_examples)
+            total_train_examples = random.sample(total_train_examples, 5000)
+
+            total_eval_examples = process_coqa_examples(total_eval_examples)
+            total_eval_examples = random.sample(total_eval_examples, 5000)
+            with open(os.path.join(args.output_dir, f'train_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_train_examples, f, indent=4)
+            with open(os.path.join(args.output_dir, f'eval_examples_seed_{args.seed}.json'), 'w') as f:
+                json.dump(total_eval_examples, f, indent=4)
+        if args.debug:
+            args.annotation_size = 10
+            args.batch_size = 1
+            total_train_examples = total_train_examples[:50]
+            total_eval_examples = total_eval_examples[:5]
+        def format_example(example, label_map, **kwargs):
+            return f"Context: {example['summary']}\n'Question': {example['question']}\n'Answer: '", f"{example['label']}"
+
+        all_train_text_to_encode = [f"summary: {raw_item['summary']}, question: {raw_item['question']}"
+                                    for raw_item in total_train_examples]
+        all_eval_text_to_encode = [f"summary: {raw_item['summary']}, question: {raw_item['question']}"
+                                   for raw_item in total_eval_examples]
+        label_map = None
     else:
         raise ValueError(f"{args.task_name} is not supported")
-    return total_train_examples,total_eval_examples,all_train_text_to_encode,\
-           all_eval_text_to_encode,format_example,label_map
+    return total_train_examples, total_eval_examples, all_train_text_to_encode, all_eval_text_to_encode, format_example, label_map
